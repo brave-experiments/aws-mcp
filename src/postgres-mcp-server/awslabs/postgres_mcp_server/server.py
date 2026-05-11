@@ -288,6 +288,13 @@ async def connect_to_database(
     db_endpoint: Annotated[str, Field(description='database endpoint')],
     port: Annotated[int, Field(description='Postgres port')],
     database: Annotated[str, Field(description='database name')],
+    username: Annotated[
+        str,
+        Field(
+            description='Database username for IAM authentication (PG_WIRE_IAM_PROTOCOL). '
+            'Overrides the cluster master username. The user must have the rds_iam role granted in the database.'
+        ),
+    ] = '',
 ) -> str:
     """Connect to a specific database save the connection internally.
 
@@ -299,6 +306,7 @@ async def connect_to_database(
         db_endpoint: database endpoint
         port: database port
         database: database name. Required parameter
+        username: database username for IAM authentication. Overrides cluster master username.
 
         Supported scenario:
         1. Aurora Postgres database with RDS_API + Credential Manager:
@@ -307,6 +315,7 @@ async def connect_to_database(
         2. Aurora Postgres database with direct connection + IAM:
             cluster_identifier must be set
             db_endpoint must be set
+            username optionally set (overrides master username for IAM auth)
         3. Aurora Postgres database with direct connection + PG_AUTH (Credential Manager):
             cluster_identifier must be set
             db_endpoint must be set
@@ -323,6 +332,7 @@ async def connect_to_database(
             db_endpoint=db_endpoint,
             port=port,
             database=database,
+            username=username,
         )
 
         # Eagerly initialize the connection pool so it's ready for queries
@@ -595,6 +605,7 @@ def internal_create_connection(
     db_endpoint: Annotated[str, Field(description='database endpoint')],
     port: Annotated[int, Field(description='Postgres port')],
     database: Annotated[str, Field(description='database name')] = 'postgres',
+    username: Annotated[str, Field(description='database username for IAM authentication')] = '',
 ) -> Tuple:
     """Connect to a specific database save the connection internally.
 
@@ -606,6 +617,7 @@ def internal_create_connection(
         db_endpoint: database endpoint
         port: database port
         database: database name
+        username: database username for IAM authentication; overrides cluster master username
     """
     global db_connection_map
     global readonly_query
@@ -618,6 +630,7 @@ def internal_create_connection(
         f'cluster_identifier:{cluster_identifier}\n'
         f'db_endpoint:{db_endpoint}\n'
         f'database:{database}\n'
+        f'username:{username}\n'
         f'readonly_query:{readonly_query}'
     )
 
@@ -655,7 +668,19 @@ def internal_create_connection(
     cluster_arn: str = ''
     secret_arn: str = ''
 
-    if cluster_identifier:
+    # For IAM auth with explicit username and endpoint, skip the describe call —
+    # the read-only DB role typically lacks rds:DescribeDBClusters.
+    iam_no_describe_needed = (
+        connection_method == ConnectionMethod.PG_WIRE_IAM_PROTOCOL
+        and username
+        and db_endpoint
+    )
+
+    if iam_no_describe_needed:
+        # All needed info supplied explicitly; skip AWS describe calls that
+        # require rds:DescribeDBClusters/rds:DescribeDBInstances permissions.
+        logger.info('Skipping cluster/instance describe — username and endpoint provided explicitly')
+    elif cluster_identifier:
         # Can be either APG (APG always requires cluster) or RPG multi-AZ cluster deployment case
         cluster_properties = internal_get_cluster_properties(
             cluster_identifier=cluster_identifier, region=region
@@ -691,13 +716,15 @@ def internal_create_connection(
 
     db_connection = None
     if connection_method == ConnectionMethod.PG_WIRE_IAM_PROTOCOL:
+        iam_user = username if username else masteruser
+        logger.info(f'IAM auth: using db_user={iam_user!r} (username={username!r}, masteruser={masteruser!r})')
         db_connection = PsycopgPoolConnection(
             host=db_endpoint,
             port=port,
             database=database,
             readonly=readonly_query,
             secret_arn='',
-            db_user=masteruser,
+            db_user=iam_user,
             region=region,
             is_iam_auth=True,
         )
@@ -893,6 +920,10 @@ def main():
     )
     parser.add_argument('--database', help='Database name')
     parser.add_argument('--port', type=int, default=5432, help='Database port (default: 5432)')
+    parser.add_argument(
+        '--username',
+        help='Database username for IAM authentication (overrides the cluster master username)',
+    )
     args = parser.parse_args()
 
     logger.info(
@@ -905,6 +936,7 @@ def main():
         f'allow_write_query:{args.allow_write_query}\n'
         f'database:{args.database}\n'
         f'port:{args.port}\n'
+        f'username:{args.username}\n'
     )
 
     readonly_query = not args.allow_write_query
@@ -923,6 +955,7 @@ def main():
                 db_endpoint=args.db_endpoint,
                 port=args.port,
                 database=args.database,
+                username=args.username or '',
             )
 
             # Test database connection
@@ -950,6 +983,23 @@ def main():
                     sys.exit(1)
                 else:
                     logger.success('Successfully validated database connection to Postgres')
+
+                # Clear connections and re-register them without initialized pools.
+                # The aiorwlock inside PsycopgPoolConnection binds to the event loop it
+                # was first used on (the asyncio.run() loop above), and would fail when
+                # the MCP server runs on its own loop. Re-creating the connection objects
+                # here means the pool will be initialized lazily on the MCP server's loop.
+                db_connection_map.close_all()
+                internal_create_connection(
+                    region=args.region,
+                    database_type=DatabaseType[args.db_type],
+                    connection_method=ConnectionMethod[args.connection_method],
+                    cluster_identifier=cluster_identifier,
+                    db_endpoint=args.db_endpoint,
+                    port=args.port,
+                    database=args.database,
+                    username=args.username or '',
+                )
 
         logger.info('Postgres MCP server started')
         mcp.run()
